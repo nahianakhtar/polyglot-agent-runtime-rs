@@ -1,4 +1,4 @@
-name: Polyglot Rust + C11 FFI CI
+name: Polyglot Rust + C11 FFI + WASM32 CI
 
 on:
   push:
@@ -11,28 +11,42 @@ env:
 
 jobs:
   test-and-bench:
-    name: Rust Stable + GCC C11 Strict Gate
+    name: Rust Stable + GCC C11 + WASM32 P2 Gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install stable Rust toolchain
+      - name: Setup Node.js 22 for WebAssembly verification
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install stable Rust toolchain + wasm32 target
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
 
-      - name: Verify C11 and Rust compilers
+      - name: Verify C11, Rust, and Node compilers
         run: |
           gcc --version
           rustc --version
           cargo --version
+          node --version
 
-      - name: Run strict Clippy lints
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Run strict Clippy lints (native + wasm32)
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
 
-      - name: Run unit & FFI safety test suite
+      - name: Run unit & FFI/WASM safety test suite
         run: cargo test --verbose
+
+      - name: Build wasm32-unknown-unknown cdylib & verify in Node.js 22 V8
+        run: |
+          cargo build --release --lib --target wasm32-unknown-unknown
+          node scripts/verify_wasm_p2.mjs
 
       - name: Execute release microbenchmark binary
         run: cargo run --release --bin bench_runtime
