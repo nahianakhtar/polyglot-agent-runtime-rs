@@ -1,0 +1,38 @@
+name: Polyglot Rust + C11 FFI CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-bench:
+    name: Rust Stable + GCC C11 Strict Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Verify C11 and Rust compilers
+        run: |
+          gcc --version
+          rustc --version
+          cargo --version
+
+      - name: Run strict Clippy lints
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run unit & FFI safety test suite
+        run: cargo test --verbose
+
+      - name: Execute release microbenchmark binary
+        run: cargo run --release --bin bench_runtime
