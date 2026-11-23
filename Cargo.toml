@@ -1,11 +1,11 @@
 [package]
 name = "polyglot-agent-runtime-rs"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Nahian Akhtar"]
 license = "MIT"
-description = "Zero-allocation cache-line-aligned C11 FFI ring telemetry vault, capability-fenced DAG orchestrator, and O(1) Jain-Chlamtac P2 streaming quantile runtime."
+description = "Zero-allocation cache-line-aligned C11 FFI ring telemetry vault, deterministic token-bucket rate limiter, capability-fenced DAG orchestrator, and O(1) Jain-Chlamtac P2 streaming quantile runtime."
 repository = "https://github.com/nahianakhtar/polyglot-agent-runtime-rs"
 keywords = ["ffi", "systems", "dag", "telemetry", "quantiles"]
 categories = ["concurrency", "algorithms", "data-structures"]
@@ -13,6 +13,7 @@ categories = ["concurrency", "algorithms", "data-structures"]
 [lib]
 name = "polyglot_agent_runtime"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "bench_runtime"

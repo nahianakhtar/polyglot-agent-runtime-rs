@@ -2,7 +2,8 @@
 //!
 //! Production-grade systems runtime combining:
 //! - **C11 FFI Cache-Line Ring Telemetry Vault** (`64`-byte aligned `ParRingSlotHeader`, Castagnoli CRC32C, zero heap allocation after initialization)
-//! - **Capability-Fenced DAG Task Orchestrator** (deterministic Kahn topological sort, cycle detection, bounded retry, and `Closed`/`Open`/`HalfOpen` circuit breaker)
+//! - **Deterministic Zero-Float-Drift Token-Bucket Rate Limiter** (`64`-byte aligned `ParTokenBucket` / `TokenBucketState`, exact sub-nanosecond rational remainder conservation across C11/Rust/WASM FFI)
+//! - **Capability-Fenced DAG Task Orchestrator & Tamper-Evident Audit Ring** (deterministic Kahn topological sort, cycle detection, bounded retry, `Closed`/`Open`/`HalfOpen` circuit breaker, and C-ABI/WASM `CapabilityAuditRing` export)
 //! - **Streaming Jain-Chlamtac P² Quantile Estimator** (`p50`, `p95`, `p99` in strict `O(1)` memory)
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -11,6 +12,10 @@ use std::fmt;
 pub const RING_MAGIC: u32 = 0x5041_5231;
 pub const RING_VERSION: u16 = 1;
 pub const MAX_PAYLOAD_LEN: usize = 192;
+pub const BUCKET_MAGIC: u32 = 0x5054_4231;
+pub const BUCKET_VERSION: u16 = 1;
+pub const NS_PER_SEC: u64 = 1_000_000_000;
+pub const DEFAULT_AUDIT_RING_SLOTS: usize = 64;
 
 /// Exact C11 ABI mirror of `ParRingSlotHeader` (`64` bytes, `64`-byte cache-line aligned).
 #[repr(C, align(64))]
@@ -44,6 +49,7 @@ pub enum FfiRingError {
     NonZeroReserved,
     HeaderCrcMismatch,
     PayloadCrcMismatch,
+    InvalidRateLimitParam,
     UnknownCode(i32),
 }
 
@@ -66,12 +72,50 @@ fn decode_ffi_status(code: i32) -> Result<(), FfiRingError> {
         -6 => Err(FfiRingError::NonZeroReserved),
         -7 => Err(FfiRingError::HeaderCrcMismatch),
         -8 => Err(FfiRingError::PayloadCrcMismatch),
+        -9 => Err(FfiRingError::InvalidRateLimitParam),
         other => Err(FfiRingError::UnknownCode(other)),
     }
 }
 
+const fn encode_ffi_error(err: FfiRingError) -> i32 {
+    match err {
+        FfiRingError::NullPointer => -1,
+        FfiRingError::MisalignedHeader => -2,
+        FfiRingError::PayloadOutOfBounds => -3,
+        FfiRingError::InvalidMagic => -4,
+        FfiRingError::UnsupportedVersion => -5,
+        FfiRingError::NonZeroReserved => -6,
+        FfiRingError::HeaderCrcMismatch => -7,
+        FfiRingError::PayloadCrcMismatch => -8,
+        FfiRingError::InvalidRateLimitParam => -9,
+        FfiRingError::UnknownCode(c) => c,
+    }
+}
+
+/// Exact C11 ABI mirror of `ParTokenBucket` (`64` bytes, `64`-byte cache-line aligned).
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenBucketState {
+    pub magic: u32,
+    pub version: u16,
+    pub flags: u16,
+    pub capacity_milli: u64,
+    pub tokens_milli: u64,
+    pub refill_per_sec_milli: u64,
+    pub last_refill_ns: u64,
+    pub rem_ns_num: u64,
+    pub allowed_count: u64,
+    pub denied_count: u64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<TokenBucketState>() == 64);
+    assert!(core::mem::align_of::<TokenBucketState>() == 64);
+};
+
+#[cfg(not(target_arch = "wasm32"))]
 mod raw_ffi {
-    use super::RingSlotHeader;
+    use super::{RingSlotHeader, TokenBucketState};
 
     extern "C" {
         pub fn par_crc32c(data: *const u8, len: usize) -> u32;
@@ -85,46 +129,245 @@ mod raw_ffi {
             payload: *const u8,
             payload_len: usize,
         ) -> i32;
+        pub fn par_token_bucket_init(
+            tb: *mut TokenBucketState,
+            capacity_milli: u64,
+            refill_per_sec_milli: u64,
+            initial_ns: u64,
+        ) -> i32;
+        pub fn par_token_bucket_try_acquire(
+            tb: *mut TokenBucketState,
+            cost_milli: u64,
+            now_ns: u64,
+            retry_after_ns_out: *mut u64,
+        ) -> i32;
     }
 }
 
-/// Safe wrapper over C11 Castagnoli CRC32C (`0x82F63B78` reflected polynomial).
+#[cfg(target_arch = "wasm32")]
+mod wasm_ring_fallback {
+    use super::{
+        RingSlotHeader, TokenBucketState, BUCKET_MAGIC, BUCKET_VERSION, MAX_PAYLOAD_LEN,
+        NS_PER_SEC, RING_MAGIC, RING_VERSION,
+    };
+
+    const PAR_HDR_HASH_BYTES: usize = 40;
+
+    #[inline]
+    pub fn crc32c_portable(data: &[u8]) -> u32 {
+        if data.is_empty() {
+            return 0;
+        }
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
+            }
+        }
+        !crc
+    }
+
+    #[inline]
+    fn header_prefix_bytes(hdr: &RingSlotHeader) -> [u8; PAR_HDR_HASH_BYTES] {
+        let mut buf = [0u8; PAR_HDR_HASH_BYTES];
+        buf[0..4].copy_from_slice(&hdr.magic.to_le_bytes());
+        buf[4..6].copy_from_slice(&hdr.version.to_le_bytes());
+        buf[6..8].copy_from_slice(&hdr.flags.to_le_bytes());
+        buf[8..16].copy_from_slice(&hdr.sequence.to_le_bytes());
+        buf[16..24].copy_from_slice(&hdr.timestamp_ns.to_le_bytes());
+        buf[24..28].copy_from_slice(&hdr.agent_id.to_le_bytes());
+        buf[28..32].copy_from_slice(&hdr.capability_mask.to_le_bytes());
+        buf[32..36].copy_from_slice(&hdr.payload_len.to_le_bytes());
+        buf[36..40].copy_from_slice(&hdr.payload_crc32c.to_le_bytes());
+        buf
+    }
+
+    pub fn seal(hdr: &mut RingSlotHeader, payload: &[u8]) -> i32 {
+        if ((hdr as *const RingSlotHeader as usize) & 63) != 0 {
+            return -2;
+        }
+        if payload.len() > MAX_PAYLOAD_LEN {
+            return -3;
+        }
+        hdr.magic = RING_MAGIC;
+        hdr.version = RING_VERSION;
+        hdr.payload_len = payload.len() as u32;
+        hdr.payload_crc32c = crc32c_portable(payload);
+        hdr.reserved = [0u8; 20];
+        let prefix = header_prefix_bytes(hdr);
+        hdr.header_crc32c = crc32c_portable(&prefix);
+        0
+    }
+
+    pub fn validate(hdr: &RingSlotHeader, payload: &[u8]) -> i32 {
+        if ((hdr as *const RingSlotHeader as usize) & 63) != 0 {
+            return -2;
+        }
+        if hdr.magic != RING_MAGIC {
+            return -4;
+        }
+        if hdr.version != RING_VERSION {
+            return -5;
+        }
+        if (hdr.payload_len as usize) > MAX_PAYLOAD_LEN || (hdr.payload_len as usize) != payload.len() {
+            return -3;
+        }
+        if hdr.reserved.iter().any(|&b| b != 0) {
+            return -6;
+        }
+        let prefix = header_prefix_bytes(hdr);
+        if crc32c_portable(&prefix) != hdr.header_crc32c {
+            return -7;
+        }
+        if crc32c_portable(payload) != hdr.payload_crc32c {
+            return -8;
+        }
+        0
+    }
+
+    pub fn bucket_init(
+        tb: &mut TokenBucketState,
+        capacity_milli: u64,
+        refill_per_sec_milli: u64,
+        initial_ns: u64,
+    ) -> i32 {
+        if ((tb as *const TokenBucketState as usize) & 63) != 0 {
+            return -2;
+        }
+        if capacity_milli == 0 {
+            return -9;
+        }
+        tb.magic = BUCKET_MAGIC;
+        tb.version = BUCKET_VERSION;
+        tb.flags = 0;
+        tb.capacity_milli = capacity_milli;
+        tb.tokens_milli = capacity_milli;
+        tb.refill_per_sec_milli = refill_per_sec_milli;
+        tb.last_refill_ns = initial_ns;
+        tb.rem_ns_num = 0;
+        tb.allowed_count = 0;
+        tb.denied_count = 0;
+        0
+    }
+
+    pub fn bucket_try_acquire(
+        tb: &mut TokenBucketState,
+        cost_milli: u64,
+        now_ns: u64,
+        retry_after_ns_out: &mut u64,
+    ) -> i32 {
+        if ((tb as *const TokenBucketState as usize) & 63) != 0 {
+            return -2;
+        }
+        if tb.magic != BUCKET_MAGIC {
+            return -4;
+        }
+        if tb.version != BUCKET_VERSION {
+            return -5;
+        }
+        if tb.capacity_milli == 0 || cost_milli > tb.capacity_milli || tb.rem_ns_num >= NS_PER_SEC {
+            return -9;
+        }
+
+        if now_ns > tb.last_refill_ns {
+            let elapsed_ns = now_ns - tb.last_refill_ns;
+            tb.last_refill_ns = now_ns;
+            if tb.refill_per_sec_milli > 0 && tb.tokens_milli < tb.capacity_milli {
+                let headroom = tb.capacity_milli - tb.tokens_milli;
+                let total_num = (elapsed_ns as u128)
+                    .saturating_mul(tb.refill_per_sec_milli as u128)
+                    .saturating_add(tb.rem_ns_num as u128);
+                let add_milli = total_num / (NS_PER_SEC as u128);
+                let new_rem = (total_num % (NS_PER_SEC as u128)) as u64;
+                if add_milli >= (headroom as u128) {
+                    tb.tokens_milli = tb.capacity_milli;
+                    tb.rem_ns_num = 0;
+                } else {
+                    tb.tokens_milli += add_milli as u64;
+                    tb.rem_ns_num = new_rem;
+                }
+            } else if tb.tokens_milli >= tb.capacity_milli {
+                tb.tokens_milli = tb.capacity_milli;
+                tb.rem_ns_num = 0;
+            }
+        }
+
+        if tb.tokens_milli >= cost_milli {
+            tb.tokens_milli -= cost_milli;
+            tb.allowed_count += 1;
+            *retry_after_ns_out = 0;
+            return 1;
+        }
+
+        tb.denied_count += 1;
+        if tb.refill_per_sec_milli == 0 {
+            *retry_after_ns_out = u64::MAX;
+        } else {
+            let deficit = (cost_milli - tb.tokens_milli) as u128;
+            let num = deficit * (NS_PER_SEC as u128) - (tb.rem_ns_num as u128);
+            let dt = num.div_ceil(tb.refill_per_sec_milli as u128);
+            *retry_after_ns_out = u64::try_from(dt).unwrap_or(u64::MAX);
+        }
+        0
+    }
+}
+
+/// Safe wrapper over Castagnoli CRC32C (`0x82F63B78` reflected polynomial).
 #[inline]
 pub fn crc32c(data: &[u8]) -> u32 {
     if data.is_empty() {
         return 0;
     }
-    // SAFETY: `data.as_ptr()` is non-null, valid for reads of `data.len()` bytes,
-    // and C11 `par_crc32c` neither retains the pointer nor mutates memory.
-    unsafe { raw_ffi::par_crc32c(data.as_ptr(), data.len()) }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // SAFETY: `data.as_ptr()` is non-null, valid for reads of `data.len()` bytes,
+        // and C11 `par_crc32c` neither retains the pointer nor mutates memory.
+        unsafe { raw_ffi::par_crc32c(data.as_ptr(), data.len()) }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_ring_fallback::crc32c_portable(data)
+    }
 }
 
-/// Seals a 64-byte cache-line-aligned ring header against `payload` via C11 FFI.
+/// Seals a 64-byte cache-line-aligned ring header against `payload` via C11 FFI (or WASM fallback).
 #[inline]
 pub fn seal_ring_header(hdr: &mut RingSlotHeader, payload: &[u8]) -> Result<(), FfiRingError> {
-    let ptr = if payload.is_empty() {
-        core::ptr::null()
-    } else {
-        payload.as_ptr()
+    #[cfg(not(target_arch = "wasm32"))]
+    let rc = {
+        let ptr = if payload.is_empty() {
+            core::ptr::null()
+        } else {
+            payload.as_ptr()
+        };
+        // SAFETY: `hdr` is a uniquely borrowed `#[repr(C, align(64))]` struct matching C11 layout,
+        // and `ptr` is valid for `payload.len()` bytes across the synchronous FFI call.
+        unsafe { raw_ffi::par_ring_header_seal(hdr as *mut RingSlotHeader, ptr, payload.len()) }
     };
-    // SAFETY: `hdr` is a uniquely borrowed `#[repr(C, align(64))]` struct matching C11 layout,
-    // and `ptr` is valid for `payload.len()` bytes across the synchronous FFI call.
-    let rc = unsafe { raw_ffi::par_ring_header_seal(hdr as *mut RingSlotHeader, ptr, payload.len()) };
+    #[cfg(target_arch = "wasm32")]
+    let rc = wasm_ring_fallback::seal(hdr, payload);
     decode_ffi_status(rc)
 }
 
-/// Validates a 64-byte cache-line-aligned ring header and its `payload` via C11 FFI.
+/// Validates a 64-byte cache-line-aligned ring header and its `payload` via C11 FFI (or WASM fallback).
 #[inline]
 pub fn validate_ring_header(hdr: &RingSlotHeader, payload: &[u8]) -> Result<(), FfiRingError> {
-    let ptr = if payload.is_empty() {
-        core::ptr::null()
-    } else {
-        payload.as_ptr()
+    #[cfg(not(target_arch = "wasm32"))]
+    let rc = {
+        let ptr = if payload.is_empty() {
+            core::ptr::null()
+        } else {
+            payload.as_ptr()
+        };
+        // SAFETY: `hdr` and `payload` are shared borrows valid for the duration of the pure C11 check.
+        unsafe {
+            raw_ffi::par_ring_header_validate(hdr as *const RingSlotHeader, ptr, payload.len())
+        }
     };
-    // SAFETY: `hdr` and `payload` are shared borrows valid for the duration of the pure C11 check.
-    let rc = unsafe {
-        raw_ffi::par_ring_header_validate(hdr as *const RingSlotHeader, ptr, payload.len())
-    };
+    #[cfg(target_arch = "wasm32")]
+    let rc = wasm_ring_fallback::validate(hdr, payload);
     decode_ffi_status(rc)
 }
 
@@ -289,6 +532,160 @@ impl<const N: usize> BoundedTelemetryVault<N> {
     }
 }
 
+/// Default `64`-slot (`16,384`-byte) cache-line-aligned capability & rate-limit audit ring.
+pub type CapabilityAuditRing = BoundedTelemetryVault<DEFAULT_AUDIT_RING_SLOTS>;
+
+/// Audit decision code stored in `RingSlotHeader::flags` inside [`BoundedTelemetryVault`].
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditDecision {
+    Allowed = 1,
+    DeniedCapability = 2,
+    DeniedRateLimit = 3,
+    DeniedCircuitOpen = 4,
+}
+
+// ============================================================================
+// Deterministic Zero-Float-Drift Token-Bucket Rate Limiter (C11 / Rust / WASM)
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateLimitDecision {
+    Allowed {
+        remaining_milli: u64,
+    },
+    Denied {
+        deficit_milli: u64,
+        retry_after_ns: u64,
+    },
+}
+
+/// Cache-line-aligned (`64`-byte) deterministic integer token-bucket rate limiter.
+///
+/// Tracks capacity and refill rates in exact milli-tokens (`1_000 == 1` token) with
+/// sub-nanosecond rational remainder conservation (`rem_ns_num < 1_000_000_000`),
+/// eliminating IEEE-754 floating-point drift across arbitrary tick frequencies.
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeterministicTokenBucket {
+    state: TokenBucketState,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<DeterministicTokenBucket>() == 64);
+    assert!(core::mem::align_of::<DeterministicTokenBucket>() == 64);
+};
+
+impl DeterministicTokenBucket {
+    pub fn new(
+        capacity_milli: u64,
+        refill_per_sec_milli: u64,
+        initial_ns: u64,
+    ) -> Result<Self, FfiRingError> {
+        let mut bucket = Self {
+            state: TokenBucketState::default(),
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let rc = unsafe {
+            // SAFETY: `bucket.state` is a uniquely owned `#[repr(C, align(64))]` struct matching C11 `ParTokenBucket`.
+            raw_ffi::par_token_bucket_init(
+                &mut bucket.state as *mut TokenBucketState,
+                capacity_milli,
+                refill_per_sec_milli,
+                initial_ns,
+            )
+        };
+        #[cfg(target_arch = "wasm32")]
+        let rc = wasm_ring_fallback::bucket_init(
+            &mut bucket.state,
+            capacity_milli,
+            refill_per_sec_milli,
+            initial_ns,
+        );
+        decode_ffi_status(rc)?;
+        Ok(bucket)
+    }
+
+    #[inline]
+    pub const fn state(&self) -> &TokenBucketState {
+        &self.state
+    }
+
+    #[inline]
+    pub const fn tokens_milli(&self) -> u64 {
+        self.state.tokens_milli
+    }
+
+    #[inline]
+    pub const fn allowed_count(&self) -> u64 {
+        self.state.allowed_count
+    }
+
+    #[inline]
+    pub const fn denied_count(&self) -> u64 {
+        self.state.denied_count
+    }
+
+    /// Computes exact ceiling nanoseconds until `cost_milli` tokens are available from current state without mutating counters.
+    #[inline]
+    pub fn retry_after_ns(&self, cost_milli: u64) -> u64 {
+        if cost_milli > self.state.capacity_milli {
+            return u64::MAX;
+        }
+        if self.state.tokens_milli >= cost_milli {
+            return 0;
+        }
+        if self.state.refill_per_sec_milli == 0 {
+            return u64::MAX;
+        }
+        let deficit = (cost_milli - self.state.tokens_milli) as u128;
+        let num = deficit * (NS_PER_SEC as u128) - (self.state.rem_ns_num as u128);
+        let dt = num.div_ceil(self.state.refill_per_sec_milli as u128);
+        u64::try_from(dt).unwrap_or(u64::MAX)
+    }
+
+    /// Attempts to acquire `cost_milli` milli-tokens at monotonic timestamp `now_ns` in `O(1)` time and `0` heap allocations.
+    #[inline]
+    pub fn try_acquire(
+        &mut self,
+        cost_milli: u64,
+        now_ns: u64,
+    ) -> Result<RateLimitDecision, FfiRingError> {
+        let mut retry_ns = 0u64;
+        #[cfg(not(target_arch = "wasm32"))]
+        let rc = unsafe {
+            // SAFETY: `self.state` and `retry_ns` are uniquely borrowed stack/struct memory valid across synchronous C11 call.
+            raw_ffi::par_token_bucket_try_acquire(
+                &mut self.state as *mut TokenBucketState,
+                cost_milli,
+                now_ns,
+                &mut retry_ns as *mut u64,
+            )
+        };
+        #[cfg(target_arch = "wasm32")]
+        let rc = wasm_ring_fallback::bucket_try_acquire(
+            &mut self.state,
+            cost_milli,
+            now_ns,
+            &mut retry_ns,
+        );
+
+        match rc {
+            1 => Ok(RateLimitDecision::Allowed {
+                remaining_milli: self.state.tokens_milli,
+            }),
+            0 => Ok(RateLimitDecision::Denied {
+                deficit_milli: cost_milli.saturating_sub(self.state.tokens_milli),
+                retry_after_ns: retry_ns,
+            }),
+            err_code => {
+                decode_ffi_status(err_code)?;
+                Err(FfiRingError::UnknownCode(err_code))
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Capability-Fenced DAG Task Orchestrator
 // ============================================================================
@@ -404,6 +801,11 @@ pub enum OrchestratorError {
         task: String,
         required: u32,
         granted: u32,
+    },
+    RateLimited {
+        task: String,
+        cost_milli: u64,
+        retry_after_ns: u64,
     },
     CircuitOpen { task: String },
     TaskExhausted {
@@ -603,6 +1005,167 @@ impl CapabilityDagOrchestrator {
             simulated_backoff_us,
         })
     }
+
+    /// Executes the DAG while enforcing an optional deterministic token-bucket rate limiter
+    /// and sealing every capability/rate/circuit decision into a C11/WASM CRC32C `BoundedTelemetryVault`.
+    pub fn execute_audited<const N: usize>(
+        &mut self,
+        ctx: AuditExecutionContext,
+        mut bucket: Option<&mut DeterministicTokenBucket>,
+        audit_ring: &mut BoundedTelemetryVault<N>,
+    ) -> Result<DagExecutionSummary, OrchestratorError> {
+        let order = self.topological_sort()?;
+
+        // Preflight capability fence across the entire plan and seal denial into the audit ring if rejected.
+        for task_id in &order {
+            let node = self.nodes.get(task_id).expect("sorted node exists");
+            if (node.required_caps & self.granted_caps) != node.required_caps {
+                let mut frame = [0u8; MAX_PAYLOAD_LEN];
+                let n = write_audit_payload(&mut frame, "deny:cap:", task_id);
+                let _ = audit_ring.record(
+                    ctx.now_ns,
+                    ctx.agent_id,
+                    node.required_caps & self.granted_caps,
+                    AuditDecision::DeniedCapability as u16,
+                    &frame[..n],
+                );
+                return Err(OrchestratorError::CapabilityDenied {
+                    task: task_id.clone(),
+                    required: node.required_caps,
+                    granted: self.granted_caps,
+                });
+            }
+        }
+
+        let mut outputs = BTreeMap::new();
+        let mut total_attempts = 0u32;
+        let mut simulated_backoff_us = 0u64;
+
+        for (step_idx, task_id) in order.iter().enumerate() {
+            let step_ns = ctx.now_ns.saturating_add(step_idx as u64);
+            if !self.breaker.allow(ctx.now_tick) {
+                let mut frame = [0u8; MAX_PAYLOAD_LEN];
+                let n = write_audit_payload(&mut frame, "deny:circuit:", task_id);
+                let _ = audit_ring.record(
+                    step_ns,
+                    ctx.agent_id,
+                    self.granted_caps,
+                    AuditDecision::DeniedCircuitOpen as u16,
+                    &frame[..n],
+                );
+                return Err(OrchestratorError::CircuitOpen {
+                    task: task_id.clone(),
+                });
+            }
+
+            if let Some(tb) = bucket.as_deref_mut() {
+                match tb.try_acquire(ctx.cost_per_task_milli, step_ns) {
+                    Ok(RateLimitDecision::Allowed { .. }) => {}
+                    Ok(RateLimitDecision::Denied { retry_after_ns, .. }) => {
+                        let mut frame = [0u8; MAX_PAYLOAD_LEN];
+                        let n = write_audit_payload(&mut frame, "deny:rate:", task_id);
+                        let _ = audit_ring.record(
+                            step_ns,
+                            ctx.agent_id,
+                            self.granted_caps,
+                            AuditDecision::DeniedRateLimit as u16,
+                            &frame[..n],
+                        );
+                        return Err(OrchestratorError::RateLimited {
+                            task: task_id.clone(),
+                            cost_milli: ctx.cost_per_task_milli,
+                            retry_after_ns,
+                        });
+                    }
+                    Err(_) => {
+                        return Err(OrchestratorError::RateLimited {
+                            task: task_id.clone(),
+                            cost_milli: ctx.cost_per_task_milli,
+                            retry_after_ns: u64::MAX,
+                        });
+                    }
+                }
+            }
+
+            let node = self.nodes.get_mut(task_id).expect("sorted node exists");
+            let req_caps = node.required_caps;
+            let max_attempts = node.retry.max_attempts.max(1);
+            let mut attempt = 0u32;
+            let mut last_err = String::new();
+            let mut succeeded = false;
+
+            while attempt < max_attempts {
+                if attempt > 0 && !self.breaker.allow(ctx.now_tick) {
+                    return Err(OrchestratorError::CircuitOpen {
+                        task: task_id.clone(),
+                    });
+                }
+                attempt += 1;
+                total_attempts += 1;
+
+                match (node.handler)(&outputs, attempt) {
+                    Ok(val) => {
+                        self.breaker.on_success();
+                        outputs.insert(task_id.clone(), val);
+                        let mut frame = [0u8; MAX_PAYLOAD_LEN];
+                        let n = write_audit_payload(&mut frame, "allow:ok:", task_id);
+                        let _ = audit_ring.record(
+                            step_ns,
+                            ctx.agent_id,
+                            req_caps,
+                            AuditDecision::Allowed as u16,
+                            &frame[..n],
+                        );
+                        succeeded = true;
+                        break;
+                    }
+                    Err(err_msg) => {
+                        self.breaker.on_failure(ctx.now_tick);
+                        last_err = err_msg;
+                        if attempt < max_attempts {
+                            simulated_backoff_us +=
+                                node.retry.base_backoff_us * (1u64 << (attempt - 1).min(10));
+                        }
+                    }
+                }
+            }
+
+            if !succeeded {
+                return Err(OrchestratorError::TaskExhausted {
+                    task: task_id.clone(),
+                    attempts: attempt,
+                    last_error: last_err,
+                });
+            }
+        }
+
+        Ok(DagExecutionSummary {
+            topological_order: order,
+            outputs,
+            total_attempts,
+            simulated_backoff_us,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditExecutionContext {
+    pub now_tick: u64,
+    pub now_ns: u64,
+    pub agent_id: u32,
+    pub cost_per_task_milli: u64,
+}
+
+#[inline]
+fn write_audit_payload(dst: &mut [u8; MAX_PAYLOAD_LEN], prefix: &str, task_id: &str) -> usize {
+    let p = prefix.as_bytes();
+    let p_len = p.len().min(MAX_PAYLOAD_LEN);
+    dst[..p_len].copy_from_slice(&p[..p_len]);
+    let rem = MAX_PAYLOAD_LEN - p_len;
+    let t = task_id.as_bytes();
+    let t_len = t.len().min(rem);
+    dst[p_len..(p_len + t_len)].copy_from_slice(&t[..t_len]);
+    p_len + t_len
 }
 
 // ============================================================================
@@ -835,6 +1398,439 @@ impl StreamingQuantileSuite {
             state_bytes: core::mem::size_of::<Self>(),
         }
     }
+}
+
+
+// ============================================================================
+// WebAssembly (`wasm32-unknown-unknown`) & C-ABI Streaming Quantile Exports
+// ============================================================================
+
+/// Returns the exact constant byte footprint (`560` bytes) of `StreamingQuantileSuite`.
+#[no_mangle]
+pub extern "C" fn par_p2_suite_state_bytes() -> usize {
+    core::mem::size_of::<StreamingQuantileSuite>()
+}
+
+/// Allocates a new constant-memory (`560` B) `StreamingQuantileSuite` on heap / WASM linear memory.
+///
+/// Caller owns the returned pointer and must release it with [`par_p2_suite_free`].
+#[no_mangle]
+pub extern "C" fn par_p2_suite_new() -> *mut StreamingQuantileSuite {
+    Box::into_raw(Box::new(StreamingQuantileSuite::new()))
+}
+
+/// Releases a `StreamingQuantileSuite` previously allocated by [`par_p2_suite_new`].
+///
+/// # Safety
+/// `suite` must either be null (no-op) or a valid pointer returned by [`par_p2_suite_new`]
+/// that has not yet been freed and is not aliased by any active reference.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_free(suite: *mut StreamingQuantileSuite) {
+    if !suite.is_null() {
+        drop(unsafe { Box::from_raw(suite) });
+    }
+}
+
+/// Resets an existing `StreamingQuantileSuite` in place with zero heap allocations.
+///
+/// # Safety
+/// `suite` must be null (no-op) or a valid, uniquely writable pointer from [`par_p2_suite_new`].
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_reset(suite: *mut StreamingQuantileSuite) {
+    if let Some(s) = unsafe { suite.as_mut() } {
+        *s = StreamingQuantileSuite::new();
+    }
+}
+
+/// Observes a single finite `f64` latency sample in `O(1)` time and `0` allocations.
+///
+/// # Safety
+/// `suite` must be null (no-op) or a valid, uniquely writable pointer from [`par_p2_suite_new`].
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_observe(suite: *mut StreamingQuantileSuite, sample: f64) {
+    if let Some(s) = unsafe { suite.as_mut() } {
+        s.observe(sample);
+    }
+}
+
+/// Batch-ingests `len` contiguous `f64` samples from WASM linear memory (`Float64Array`)
+/// in a single FFI/WASM call and returns the updated total observation count.
+///
+/// # Safety
+/// - `suite` must be null (returns `0`) or a valid, uniquely writable pointer from [`par_p2_suite_new`].
+/// - When `len > 0`, `samples_ptr` must be non-null, properly `f64`-aligned, and valid for reads
+///   of `len` contiguous `f64` elements without aliasing `suite`.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_observe_batch(
+    suite: *mut StreamingQuantileSuite,
+    samples_ptr: *const f64,
+    len: usize,
+) -> u64 {
+    let Some(s) = (unsafe { suite.as_mut() }) else {
+        return 0;
+    };
+    if len == 0 || samples_ptr.is_null() {
+        return s.snapshot().count;
+    }
+    let slice = unsafe { core::slice::from_raw_parts(samples_ptr, len) };
+    for &sample in slice {
+        s.observe(sample);
+    }
+    s.snapshot().count
+}
+
+/// Allocates a contiguous `f64` scratch buffer in WASM linear memory for zero-copy JS `Float64Array` writes.
+#[no_mangle]
+pub extern "C" fn par_p2_alloc_f64_buffer(len: usize) -> *mut f64 {
+    if len == 0 {
+        return core::ptr::null_mut();
+    }
+    let mut buf = vec![0.0_f64; len].into_boxed_slice();
+    let ptr = buf.as_mut_ptr();
+    core::mem::forget(buf);
+    ptr
+}
+
+/// Frees a contiguous `f64` scratch buffer previously allocated by [`par_p2_alloc_f64_buffer`].
+///
+/// # Safety
+/// `ptr` must either be null (no-op) or a pointer returned by [`par_p2_alloc_f64_buffer`]
+/// with the exact same `len`, and must not be used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_free_f64_buffer(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() && len > 0 {
+        let raw_slice = core::ptr::slice_from_raw_parts_mut(ptr, len);
+        drop(unsafe { Box::from_raw(raw_slice) });
+    }
+}
+
+/// Allocates a contiguous `u8` scratch buffer in WASM linear memory for checksum/frame verification.
+#[no_mangle]
+pub extern "C" fn par_wasm_alloc_bytes(len: usize) -> *mut u8 {
+    if len == 0 {
+        return core::ptr::null_mut();
+    }
+    let mut buf = vec![0_u8; len].into_boxed_slice();
+    let ptr = buf.as_mut_ptr();
+    core::mem::forget(buf);
+    ptr
+}
+
+/// Frees a byte buffer previously allocated by [`par_wasm_alloc_bytes`].
+///
+/// # Safety
+/// `ptr` must either be null (no-op) or a pointer returned by [`par_wasm_alloc_bytes`] with the exact `len`.
+#[no_mangle]
+pub unsafe extern "C" fn par_wasm_free_bytes(ptr: *mut u8, len: usize) {
+    if !ptr.is_null() && len > 0 {
+        let raw_slice = core::ptr::slice_from_raw_parts_mut(ptr, len);
+        drop(unsafe { Box::from_raw(raw_slice) });
+    }
+}
+
+/// Returns total observations ingested into `suite` (`0` if `suite` is null).
+///
+/// # Safety
+/// `suite` must be null or a valid shared pointer to a live `StreamingQuantileSuite`.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_count(suite: *const StreamingQuantileSuite) -> u64 {
+    unsafe { suite.as_ref() }.map_or(0, |s| s.snapshot().count)
+}
+
+/// Returns minimum observed sample (`0.0` if empty or null).
+///
+/// # Safety
+/// `suite` must be null or a valid shared pointer to a live `StreamingQuantileSuite`.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_min(suite: *const StreamingQuantileSuite) -> f64 {
+    unsafe { suite.as_ref() }.map_or(0.0, |s| s.snapshot().min)
+}
+
+/// Returns streaming Jain-Chlamtac `P²` median (`p50`) estimate (`0.0` if empty or null).
+///
+/// # Safety
+/// `suite` must be null or a valid shared pointer to a live `StreamingQuantileSuite`.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_p50(suite: *const StreamingQuantileSuite) -> f64 {
+    unsafe { suite.as_ref() }.map_or(0.0, |s| s.snapshot().p50)
+}
+
+/// Returns streaming Jain-Chlamtac `P²` `p95` tail-latency estimate (`0.0` if empty or null).
+///
+/// # Safety
+/// `suite` must be null or a valid shared pointer to a live `StreamingQuantileSuite`.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_p95(suite: *const StreamingQuantileSuite) -> f64 {
+    unsafe { suite.as_ref() }.map_or(0.0, |s| s.snapshot().p95)
+}
+
+/// Returns streaming Jain-Chlamtac `P²` `p99` tail-latency estimate (`0.0` if empty or null).
+///
+/// # Safety
+/// `suite` must be null or a valid shared pointer to a live `StreamingQuantileSuite`.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_p99(suite: *const StreamingQuantileSuite) -> f64 {
+    unsafe { suite.as_ref() }.map_or(0.0, |s| s.snapshot().p99)
+}
+
+/// Returns maximum observed sample (`0.0` if empty or null).
+///
+/// # Safety
+/// `suite` must be null or a valid shared pointer to a live `StreamingQuantileSuite`.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_max(suite: *const StreamingQuantileSuite) -> f64 {
+    unsafe { suite.as_ref() }.map_or(0.0, |s| s.snapshot().max)
+}
+
+/// Returns Welford streaming arithmetic mean (`0.0` if empty or null).
+///
+/// # Safety
+/// `suite` must be null or a valid shared pointer to a live `StreamingQuantileSuite`.
+#[no_mangle]
+pub unsafe extern "C" fn par_p2_suite_mean(suite: *const StreamingQuantileSuite) -> f64 {
+    unsafe { suite.as_ref() }.map_or(0.0, |s| s.snapshot().mean)
+}
+
+/// Computes RFC 3720 Castagnoli CRC32C over `len` bytes in WASM / C-ABI linear memory.
+///
+/// # Safety
+/// When `len > 0`, `data_ptr` must be non-null and valid for reads of `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn par_wasm_crc32c(data_ptr: *const u8, len: usize) -> u32 {
+    if len == 0 || data_ptr.is_null() {
+        return 0;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(data_ptr, len) };
+    crc32c(bytes)
+}
+
+// ============================================================================
+// C-ABI & WebAssembly Token-Bucket Rate Limiter + Capability Audit Ring Exports
+// ============================================================================
+
+/// Returns the exact constant byte footprint (`64` bytes = `1` cache line) of [`DeterministicTokenBucket`].
+#[no_mangle]
+pub extern "C" fn par_bucket_state_bytes() -> usize {
+    core::mem::size_of::<DeterministicTokenBucket>()
+}
+
+/// Allocates a new `64`-byte cache-line-aligned [`DeterministicTokenBucket`] in heap / WASM linear memory.
+///
+/// Returns null if `capacity_milli == 0`. Caller must release with [`par_bucket_free`].
+#[no_mangle]
+pub extern "C" fn par_bucket_new(
+    capacity_milli: u64,
+    refill_per_sec_milli: u64,
+    initial_ns: u64,
+) -> *mut DeterministicTokenBucket {
+    match DeterministicTokenBucket::new(capacity_milli, refill_per_sec_milli, initial_ns) {
+        Ok(b) => Box::into_raw(Box::new(b)),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Releases a [`DeterministicTokenBucket`] previously allocated by [`par_bucket_new`].
+///
+/// # Safety
+/// `bucket` must either be null (no-op) or a valid unaliased pointer returned by [`par_bucket_new`].
+#[no_mangle]
+pub unsafe extern "C" fn par_bucket_free(bucket: *mut DeterministicTokenBucket) {
+    if !bucket.is_null() {
+        drop(unsafe { Box::from_raw(bucket) });
+    }
+}
+
+/// Attempts to acquire `cost_milli` milli-tokens at `now_ns`.
+///
+/// Returns `1` if allowed, `0` if rate-limited, or a negative `PAR_ERR_*` code on invalid input.
+///
+/// # Safety
+/// `bucket` must be null (returns `-1`) or a valid uniquely writable pointer from [`par_bucket_new`].
+#[no_mangle]
+pub unsafe extern "C" fn par_bucket_try_acquire(
+    bucket: *mut DeterministicTokenBucket,
+    cost_milli: u64,
+    now_ns: u64,
+) -> i32 {
+    let Some(tb) = (unsafe { bucket.as_mut() }) else {
+        return -1;
+    };
+    match tb.try_acquire(cost_milli, now_ns) {
+        Ok(RateLimitDecision::Allowed { .. }) => 1,
+        Ok(RateLimitDecision::Denied { .. }) => 0,
+        Err(err) => encode_ffi_error(err),
+    }
+}
+
+/// Returns exact ceiling nanoseconds until `cost_milli` milli-tokens become available from current state (`0` if immediately available or null).
+///
+/// # Safety
+/// `bucket` must be null or a valid shared pointer to a live [`DeterministicTokenBucket`].
+#[no_mangle]
+pub unsafe extern "C" fn par_bucket_retry_after_ns(
+    bucket: *const DeterministicTokenBucket,
+    cost_milli: u64,
+) -> u64 {
+    unsafe { bucket.as_ref() }.map_or(0, |tb| tb.retry_after_ns(cost_milli))
+}
+
+/// Returns currently available milli-tokens (`0` if `bucket` is null).
+///
+/// # Safety
+/// `bucket` must be null or a valid shared pointer to a live [`DeterministicTokenBucket`].
+#[no_mangle]
+pub unsafe extern "C" fn par_bucket_tokens_milli(bucket: *const DeterministicTokenBucket) -> u64 {
+    unsafe { bucket.as_ref() }.map_or(0, |tb| tb.tokens_milli())
+}
+
+/// Returns cumulative allowed acquisitions (`0` if `bucket` is null).
+///
+/// # Safety
+/// `bucket` must be null or a valid shared pointer to a live [`DeterministicTokenBucket`].
+#[no_mangle]
+pub unsafe extern "C" fn par_bucket_allowed_count(bucket: *const DeterministicTokenBucket) -> u64 {
+    unsafe { bucket.as_ref() }.map_or(0, |tb| tb.allowed_count())
+}
+
+/// Returns cumulative rate-limited rejections (`0` if `bucket` is null).
+///
+/// # Safety
+/// `bucket` must be null or a valid shared pointer to a live [`DeterministicTokenBucket`].
+#[no_mangle]
+pub unsafe extern "C" fn par_bucket_denied_count(bucket: *const DeterministicTokenBucket) -> u64 {
+    unsafe { bucket.as_ref() }.map_or(0, |tb| tb.denied_count())
+}
+
+/// Returns the exact byte size (`256` bytes = `4` cache lines) of a single [`RingSlot`].
+#[no_mangle]
+pub extern "C" fn par_audit_ring_slot_bytes() -> usize {
+    core::mem::size_of::<RingSlot>()
+}
+
+/// Returns the fixed slot capacity (`64` slots = `16,384` bytes) of [`CapabilityAuditRing`].
+#[no_mangle]
+pub extern "C" fn par_audit_ring_capacity() -> usize {
+    DEFAULT_AUDIT_RING_SLOTS
+}
+
+/// Allocates a new zero-post-init-allocation `64`-slot [`CapabilityAuditRing`] (`16,384` B).
+///
+/// Caller owns the returned pointer and must release it with [`par_audit_ring_free`].
+#[no_mangle]
+pub extern "C" fn par_audit_ring_new() -> *mut CapabilityAuditRing {
+    Box::into_raw(Box::new(CapabilityAuditRing::new()))
+}
+
+/// Releases a [`CapabilityAuditRing`] previously allocated by [`par_audit_ring_new`].
+///
+/// # Safety
+/// `ring` must either be null (no-op) or a valid unaliased pointer returned by [`par_audit_ring_new`].
+#[no_mangle]
+pub unsafe extern "C" fn par_audit_ring_free(ring: *mut CapabilityAuditRing) {
+    if !ring.is_null() {
+        drop(unsafe { Box::from_raw(ring) });
+    }
+}
+
+/// Evaluates capability bitmask fence `(required_caps & granted_caps) == required_caps`,
+/// seals a `64`-byte Castagnoli CRC32C audit slot in `ring`, and returns:
+/// - `1` if capability check passed (`AuditDecision::Allowed`),
+/// - `0` if capability check was denied (`AuditDecision::DeniedCapability`, still sealed in audit ring),
+/// - negative `PAR_ERR_*` code on null ring or payload bounds violation.
+///
+/// # Safety
+/// - `ring` must be null (returns `-1`) or a valid uniquely writable pointer from [`par_audit_ring_new`].
+/// - When `payload_len > 0`, `payload_ptr` must be non-null and valid for reads of `payload_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn par_audit_ring_record(
+    ring: *mut CapabilityAuditRing,
+    timestamp_ns: u64,
+    agent_id: u32,
+    required_caps: u32,
+    granted_caps: u32,
+    payload_ptr: *const u8,
+    payload_len: usize,
+) -> i32 {
+    let Some(r) = (unsafe { ring.as_mut() }) else {
+        return -1;
+    };
+    if payload_len > 0 && payload_ptr.is_null() {
+        return -1;
+    }
+    let payload = if payload_len == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(payload_ptr, payload_len) }
+    };
+    let allowed = (required_caps & granted_caps) == required_caps;
+    let flags = if allowed {
+        AuditDecision::Allowed as u16
+    } else {
+        AuditDecision::DeniedCapability as u16
+    };
+    match r.record(
+        timestamp_ns,
+        agent_id,
+        required_caps & granted_caps,
+        flags,
+        payload,
+    ) {
+        Ok(_) => i32::from(allowed),
+        Err(err) => encode_ffi_error(err),
+    }
+}
+
+/// Verifies header + payload Castagnoli CRC32C across all populated slots in `ring`.
+///
+/// Returns the verified slot count (`0..=64`) or a negative `PAR_ERR_*` tamper error code.
+///
+/// # Safety
+/// `ring` must be null (returns `-1`) or a valid shared pointer to a live [`CapabilityAuditRing`].
+#[no_mangle]
+pub unsafe extern "C" fn par_audit_ring_verify_all(ring: *const CapabilityAuditRing) -> i32 {
+    let Some(r) = (unsafe { ring.as_ref() }) else {
+        return -1;
+    };
+    match r.verify_all() {
+        Ok(count) => count as i32,
+        Err(err) => encode_ffi_error(err),
+    }
+}
+
+/// Returns current populated slot count (`0..=64`, or `0` if `ring` is null).
+///
+/// # Safety
+/// `ring` must be null or a valid shared pointer to a live [`CapabilityAuditRing`].
+#[no_mangle]
+pub unsafe extern "C" fn par_audit_ring_len(ring: *const CapabilityAuditRing) -> usize {
+    unsafe { ring.as_ref() }.map_or(0, BoundedTelemetryVault::len)
+}
+
+/// Returns monotonic total audit records written since initialization (`0` if `ring` is null).
+///
+/// # Safety
+/// `ring` must be null or a valid shared pointer to a live [`CapabilityAuditRing`].
+#[no_mangle]
+pub unsafe extern "C" fn par_audit_ring_total_written(ring: *const CapabilityAuditRing) -> u64 {
+    unsafe { ring.as_ref() }.map_or(0, BoundedTelemetryVault::total_written)
+}
+
+/// Returns a read-only pointer to `RingSlot` at `slot_index` in linear memory (or null if out of bounds).
+///
+/// # Safety
+/// `ring` must be null or a valid shared pointer to a live [`CapabilityAuditRing`].
+#[no_mangle]
+pub unsafe extern "C" fn par_audit_ring_slot_ptr(
+    ring: *const CapabilityAuditRing,
+    slot_index: usize,
+) -> *const RingSlot {
+    let Some(r) = (unsafe { ring.as_ref() }) else {
+        return core::ptr::null();
+    };
+    if slot_index >= r.len() {
+        return core::ptr::null();
+    }
+    &r.slots[slot_index] as *const RingSlot
 }
 
 #[cfg(test)]
@@ -1148,4 +2144,229 @@ mod tests {
         assert!((snap.p99 - 990.0).abs() < 3.0, "p99={} out of tolerance", snap.p99);
         assert!((snap.mean - 500.0).abs() < 2.0);
     }
-      }
+
+    #[test]
+    fn test_wasm_c_abi_p2_suite_lifecycle_and_batch_ingest() {
+        assert_eq!(par_p2_suite_state_bytes(), 560);
+        let suite = par_p2_suite_new();
+        assert!(!suite.is_null());
+
+        let batch_len = 1_000usize;
+        let buf = par_p2_alloc_f64_buffer(batch_len);
+        assert!(!buf.is_null());
+
+        // SAFETY: `suite` and `buf` were freshly allocated with exact capacities above.
+        unsafe {
+            for round in 0..25usize {
+                let slice = core::slice::from_raw_parts_mut(buf, batch_len);
+                for (idx, slot) in slice.iter_mut().enumerate() {
+                    let i = (round * batch_len + idx) as f64;
+                    *slot = (i * 0.618_033_988_749_894_9).fract() * 1000.0;
+                }
+                let count = par_p2_suite_observe_batch(suite, buf, batch_len);
+                assert_eq!(count, ((round + 1) * batch_len) as u64);
+            }
+
+            assert_eq!(par_p2_suite_count(suite), 25_000);
+            assert!((par_p2_suite_p50(suite) - 500.0).abs() < 6.0);
+            assert!((par_p2_suite_p95(suite) - 950.0).abs() < 6.0);
+            assert!((par_p2_suite_p99(suite) - 990.0).abs() < 4.0);
+            assert!((par_p2_suite_mean(suite) - 500.0).abs() < 2.0);
+            assert!(par_p2_suite_min(suite) >= 0.0 && par_p2_suite_max_helper(suite) <= 1000.0);
+
+            par_p2_suite_reset(suite);
+            assert_eq!(par_p2_suite_count(suite), 0);
+            par_p2_suite_observe(suite, 42.25);
+            assert_eq!(par_p2_suite_count(suite), 1);
+            assert!((par_p2_suite_p50(suite) - 42.25).abs() < 1e-9);
+
+            let check_vec = b"123456789";
+            let bptr = par_wasm_alloc_bytes(check_vec.len());
+            core::ptr::copy_nonoverlapping(check_vec.as_ptr(), bptr, check_vec.len());
+            assert_eq!(par_wasm_crc32c(bptr, check_vec.len()), 0xE306_9283);
+            par_wasm_free_bytes(bptr, check_vec.len());
+
+            par_p2_free_f64_buffer(buf, batch_len);
+            par_p2_suite_free(suite);
+        }
+    }
+
+    unsafe fn par_p2_suite_max_helper(suite: *const StreamingQuantileSuite) -> f64 {
+        unsafe { par_p2_suite_max(suite) }
+    }
+
+    #[test]
+    fn test_wasm_c_abi_null_pointer_guards() {
+        assert_eq!(par_p2_alloc_f64_buffer(0), core::ptr::null_mut());
+        assert_eq!(par_wasm_alloc_bytes(0), core::ptr::null_mut());
+        // SAFETY: Testing explicit null-pointer defensive no-op contracts.
+        unsafe {
+            assert_eq!(par_p2_suite_count(core::ptr::null()), 0);
+            assert_eq!(par_p2_suite_p50(core::ptr::null()), 0.0);
+            assert_eq!(par_p2_suite_p95(core::ptr::null()), 0.0);
+            assert_eq!(par_p2_suite_p99(core::ptr::null()), 0.0);
+            assert_eq!(par_p2_suite_observe_batch(core::ptr::null_mut(), core::ptr::null(), 8), 0);
+            assert_eq!(par_wasm_crc32c(core::ptr::null(), 16), 0);
+            par_p2_suite_observe(core::ptr::null_mut(), 10.0);
+            par_p2_suite_reset(core::ptr::null_mut());
+            par_p2_suite_free(core::ptr::null_mut());
+            par_p2_free_f64_buffer(core::ptr::null_mut(), 0);
+            par_wasm_free_bytes(core::ptr::null_mut(), 0);
+            assert_eq!(par_bucket_try_acquire(core::ptr::null_mut(), 1000, 0), -1);
+            assert_eq!(par_bucket_retry_after_ns(core::ptr::null(), 1000), 0);
+            assert_eq!(par_bucket_tokens_milli(core::ptr::null()), 0);
+            assert_eq!(par_bucket_allowed_count(core::ptr::null()), 0);
+            assert_eq!(par_bucket_denied_count(core::ptr::null()), 0);
+            par_bucket_free(core::ptr::null_mut());
+            assert_eq!(
+                par_audit_ring_record(core::ptr::null_mut(), 0, 0, 1, 1, core::ptr::null(), 0),
+                -1
+            );
+            assert_eq!(par_audit_ring_verify_all(core::ptr::null()), -1);
+            assert_eq!(par_audit_ring_len(core::ptr::null()), 0);
+            assert_eq!(par_audit_ring_total_written(core::ptr::null()), 0);
+            assert_eq!(par_audit_ring_slot_ptr(core::ptr::null(), 0), core::ptr::null());
+            par_audit_ring_free(core::ptr::null_mut());
+        }
+        assert_eq!(par_bucket_new(0, 1000, 0), core::ptr::null_mut());
+    }
+
+    #[test]
+    fn test_token_bucket_exact_nanosecond_conservation_and_c11_parity() {
+        assert_eq!(par_bucket_state_bytes(), 64);
+        assert_eq!(
+            DeterministicTokenBucket::new(0, 1_000, 0),
+            Err(FfiRingError::InvalidRateLimitParam)
+        );
+
+        // Prime refill rate (3,333 milli-tokens/sec) to stress fractional nanosecond remainders.
+        let mut tb = DeterministicTokenBucket::new(5_000, 3_333, 1_000_000).unwrap();
+        assert_eq!(
+            tb.try_acquire(5_001, 1_000_000),
+            Err(FfiRingError::InvalidRateLimitParam)
+        );
+
+        // Drain full 5,000 milli-token burst at t = 1_000_000 ns.
+        assert_eq!(
+            tb.try_acquire(5_000, 1_000_000),
+            Ok(RateLimitDecision::Allowed { remaining_milli: 0 })
+        );
+
+        // Non-monotonic timestamp (clock skew stepback) must neither panic nor mint tokens.
+        let skew = tb.try_acquire(1_000, 999_500).unwrap();
+        let expected_wait = tb.retry_after_ns(1_000);
+        assert_eq!(
+            skew,
+            RateLimitDecision::Denied {
+                deficit_milli: 1_000,
+                retry_after_ns: expected_wait,
+            }
+        );
+
+        // Step 1,000 ticks of 1_000_000 ns (1 ms each = 1.000s total) -> must conserve exact 3,333 milli-tokens!
+        let mut now = 1_000_000u64;
+        for _ in 0..1_000 {
+            now += 1_000_000;
+            let _ = tb.try_acquire(5_000, now).unwrap(); // denied while accumulating exact remainder
+        }
+        assert_eq!(
+            tb.tokens_milli(),
+            3_333,
+            "1000 x 1ms steps at 3333 milli/s must conserve exact 3333 milli-tokens with zero float drift"
+        );
+
+        // Exact 1-nanosecond boundary proof for acquiring 4,000 milli-tokens (deficit = 667 milli-tokens):
+        let wait_ns = tb.retry_after_ns(4_000);
+        assert!(wait_ns > 0);
+        let one_ns_early = tb.try_acquire(4_000, now + wait_ns - 1).unwrap();
+        assert!(
+            matches!(one_ns_early, RateLimitDecision::Denied { retry_after_ns: 1, .. }),
+            "1ns prior to exact ceiling retry_after_ns must deny with remaining wait == 1ns, got {one_ns_early:?}"
+        );
+        assert_eq!(
+            tb.try_acquire(4_000, now + wait_ns),
+            Ok(RateLimitDecision::Allowed { remaining_milli: 0 }),
+            "exact now + retry_after_ns must succeed with 0 deficit"
+        );
+    }
+
+    #[test]
+    fn test_audited_dag_and_c_abi_capability_audit_ring_export() {
+        let mut ring = BoundedTelemetryVault::<16>::new();
+        let mut tb = DeterministicTokenBucket::new(2_000, 1_000, 0).unwrap();
+        let mut dag = CapabilityDagOrchestrator::new(
+            capabilities::FS_READ | capabilities::TOOL_EXEC,
+            CircuitBreaker::new(3, 5),
+        );
+        for id in ["t1", "t2", "t3"] {
+            dag.add_task(DagNode {
+                id: id.into(),
+                deps: vec![],
+                required_caps: capabilities::FS_READ,
+                retry: RetryPolicy::default(),
+                handler: Box::new(|_, _| Ok(1)),
+            })
+            .unwrap();
+        }
+
+        // Cost = 1,000 milli per task, burst = 2,000 milli -> t1 & t2 allowed, t3 rate-limited!
+        let err = dag
+            .execute_audited(
+                AuditExecutionContext {
+                    now_tick: 1,
+                    now_ns: 10_000,
+                    agent_id: 42,
+                    cost_per_task_milli: 1_000,
+                },
+                Some(&mut tb),
+                &mut ring,
+            )
+            .expect_err("3rd task must hit token bucket limit");
+        assert!(matches!(err, OrchestratorError::RateLimited { ref task, .. } if task == "t3"));
+        assert_eq!(ring.verify_all(), Ok(3));
+        assert_eq!(ring.read_slot(0).unwrap().flags, AuditDecision::Allowed as u16);
+        assert_eq!(ring.read_slot(1).unwrap().flags, AuditDecision::Allowed as u16);
+        assert_eq!(ring.read_slot(2).unwrap().flags, AuditDecision::DeniedRateLimit as u16);
+
+        // Verify C-ABI capability audit ring lifecycle & CRC32C tamper detection.
+        assert_eq!(par_audit_ring_slot_bytes(), 256);
+        assert_eq!(par_audit_ring_capacity(), 64);
+        let c_ring = par_audit_ring_new();
+        assert!(!c_ring.is_null());
+        unsafe {
+            let allow_msg = b"tool:rag_search";
+            let rc_ok = par_audit_ring_record(
+                c_ring,
+                50_000,
+                7,
+                capabilities::FS_READ,
+                capabilities::FS_READ | capabilities::NET_HTTP,
+                allow_msg.as_ptr(),
+                allow_msg.len(),
+            );
+            assert_eq!(rc_ok, 1);
+
+            let deny_msg = b"tool:gpu_dispatch";
+            let rc_deny = par_audit_ring_record(
+                c_ring,
+                50_100,
+                7,
+                capabilities::GPU_DISPATCH,
+                capabilities::FS_READ,
+                deny_msg.as_ptr(),
+                deny_msg.len(),
+            );
+            assert_eq!(rc_deny, 0);
+
+            assert_eq!(par_audit_ring_len(c_ring), 2);
+            assert_eq!(par_audit_ring_total_written(c_ring), 2);
+            assert_eq!(par_audit_ring_verify_all(c_ring), 2);
+
+            let slot1_ptr = par_audit_ring_slot_ptr(c_ring, 1);
+            assert!(!slot1_ptr.is_null());
+            assert_eq!((*slot1_ptr).header.flags, AuditDecision::DeniedCapability as u16);
+
+            par_audit_ring_free(c_ring);
+        }
+    }
+}

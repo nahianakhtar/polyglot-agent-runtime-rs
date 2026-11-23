@@ -7,6 +7,10 @@ _Static_assert(_Alignof(ParRingSlotHeader) == PAR_CACHE_LINE_BYTES,
                "ParRingSlotHeader must be 64-byte cache-line aligned");
 _Static_assert(offsetof(ParRingSlotHeader, header_crc32c) == PAR_HDR_HASH_BYTES,
                "header_crc32c must sit immediately after the 40-byte hashed prefix");
+_Static_assert(sizeof(ParTokenBucket) == PAR_CACHE_LINE_BYTES,
+               "ParTokenBucket must occupy exactly one 64-byte cache line");
+_Static_assert(_Alignof(ParTokenBucket) == PAR_CACHE_LINE_BYTES,
+               "ParTokenBucket must be 64-byte cache-line aligned");
 
 static const uint32_t CRC32C_TABLE[256] = {
     0x00000000U, 0xF26B8303U, 0xE13B70F7U, 0x1350F3F4U, 0xC79A971FU, 0x35F1141CU, 0x26A1E7E8U, 0xD4CA64EBU,
@@ -131,4 +135,169 @@ int32_t par_ring_header_validate(
     }
 
     return PAR_OK;
+}
+
+/* Computes exact ceiling nanoseconds until deficit_milli (>= 1) refills at rate (>= 1)
+ * given accumulated sub-token remainder rem_ns_num (< 1e9), without 128-bit compiler extensions.
+ */
+static uint64_t par_exact_retry_after_ns(
+    uint64_t deficit_milli,
+    uint64_t rem_ns_num,
+    uint64_t rate
+) {
+    const uint64_t a = deficit_milli - 1U;
+    const uint64_t c = (PAR_NS_PER_SEC - rem_ns_num) - 1U;
+    const uint64_t q_hi = a / rate;
+    const uint64_t r_a = a % rate;
+
+    uint64_t q_lo = 0U;
+    uint64_t rem = 0U;
+    for (int bit = 29; bit >= 0; --bit) {
+        q_lo <<= 1U;
+        if (rem >= rate - rem) {
+            rem = rem - (rate - rem);
+            q_lo += 1U;
+        } else {
+            rem += rem;
+        }
+        if (((PAR_NS_PER_SEC >> (unsigned)bit) & 1ULL) != 0ULL) {
+            if (rem >= rate - r_a) {
+                rem = rem - (rate - r_a);
+                q_lo += 1U;
+            } else {
+                rem += r_a;
+            }
+        }
+    }
+
+    q_lo += c / rate;
+    const uint64_t c_rem = c % rate;
+    if (rem >= rate - c_rem) {
+        q_lo += 1U;
+    }
+
+    if (q_hi > (UINT64_MAX - q_lo - 1U) / PAR_NS_PER_SEC) {
+        return UINT64_MAX;
+    }
+    return q_hi * PAR_NS_PER_SEC + q_lo + 1U;
+}
+
+int32_t par_token_bucket_init(
+    ParTokenBucket *tb,
+    uint64_t capacity_milli,
+    uint64_t refill_per_sec_milli,
+    uint64_t initial_ns
+) {
+    if (tb == NULL) {
+        return PAR_ERR_NULL;
+    }
+    if (!par_is_cache_aligned(tb)) {
+        return PAR_ERR_ALIGN;
+    }
+    if (capacity_milli == 0U) {
+        return PAR_ERR_RATE_PARAM;
+    }
+
+    tb->magic = PAR_BUCKET_MAGIC;
+    tb->version = (uint16_t)PAR_BUCKET_VERSION;
+    tb->flags = 0U;
+    tb->capacity_milli = capacity_milli;
+    tb->tokens_milli = capacity_milli;
+    tb->refill_per_sec_milli = refill_per_sec_milli;
+    tb->last_refill_ns = initial_ns;
+    tb->rem_ns_num = 0U;
+    tb->allowed_count = 0U;
+    tb->denied_count = 0U;
+    return PAR_OK;
+}
+
+int32_t par_token_bucket_try_acquire(
+    ParTokenBucket *tb,
+    uint64_t cost_milli,
+    uint64_t now_ns,
+    uint64_t *retry_after_ns_out
+) {
+    if (tb == NULL) {
+        return PAR_ERR_NULL;
+    }
+    if (!par_is_cache_aligned(tb)) {
+        return PAR_ERR_ALIGN;
+    }
+    if (tb->magic != PAR_BUCKET_MAGIC) {
+        return PAR_ERR_MAGIC;
+    }
+    if (tb->version != (uint16_t)PAR_BUCKET_VERSION) {
+        return PAR_ERR_VERSION;
+    }
+    if (tb->capacity_milli == 0U || cost_milli > tb->capacity_milli || tb->rem_ns_num >= PAR_NS_PER_SEC) {
+        return PAR_ERR_RATE_PARAM;
+    }
+
+    if (now_ns > tb->last_refill_ns) {
+        const uint64_t elapsed_ns = now_ns - tb->last_refill_ns;
+        tb->last_refill_ns = now_ns;
+        if (tb->refill_per_sec_milli > 0U && tb->tokens_milli < tb->capacity_milli) {
+            const uint64_t whole_sec = elapsed_ns / PAR_NS_PER_SEC;
+            const uint64_t sub_ns = elapsed_ns % PAR_NS_PER_SEC;
+            const uint64_t headroom = tb->capacity_milli - tb->tokens_milli;
+
+            if (whole_sec > 0U && whole_sec > UINT64_MAX / tb->refill_per_sec_milli) {
+                tb->tokens_milli = tb->capacity_milli;
+                tb->rem_ns_num = 0U;
+            } else {
+                const uint64_t add_whole = whole_sec * tb->refill_per_sec_milli;
+                const uint64_t rate_hi = tb->refill_per_sec_milli / PAR_NS_PER_SEC;
+                const uint64_t rate_lo = tb->refill_per_sec_milli % PAR_NS_PER_SEC;
+                const uint64_t num = sub_ns * rate_lo + tb->rem_ns_num;
+                const uint64_t add_sub_lo = num / PAR_NS_PER_SEC;
+                const uint64_t new_rem = num % PAR_NS_PER_SEC;
+                uint64_t add_sub_hi = 0U;
+                int saturated = 0;
+
+                if (sub_ns > 0U && rate_hi > UINT64_MAX / sub_ns) {
+                    saturated = 1;
+                } else {
+                    add_sub_hi = sub_ns * rate_hi;
+                }
+
+                if (saturated
+                    || add_whole >= headroom
+                    || add_sub_hi >= headroom - add_whole
+                    || add_sub_lo >= headroom - add_whole - add_sub_hi) {
+                    tb->tokens_milli = tb->capacity_milli;
+                    tb->rem_ns_num = 0U;
+                } else {
+                    tb->tokens_milli += add_whole + add_sub_hi + add_sub_lo;
+                    tb->rem_ns_num = new_rem;
+                }
+            }
+        } else if (tb->tokens_milli >= tb->capacity_milli) {
+            tb->tokens_milli = tb->capacity_milli;
+            tb->rem_ns_num = 0U;
+        }
+    }
+
+    if (tb->tokens_milli >= cost_milli) {
+        tb->tokens_milli -= cost_milli;
+        tb->allowed_count += 1U;
+        if (retry_after_ns_out != NULL) {
+            *retry_after_ns_out = 0U;
+        }
+        return 1;
+    }
+
+    tb->denied_count += 1U;
+    if (retry_after_ns_out != NULL) {
+        if (tb->refill_per_sec_milli == 0U) {
+            *retry_after_ns_out = UINT64_MAX;
+        } else {
+            const uint64_t deficit_milli = cost_milli - tb->tokens_milli;
+            *retry_after_ns_out = par_exact_retry_after_ns(
+                deficit_milli,
+                tb->rem_ns_num,
+                tb->refill_per_sec_milli
+            );
+        }
+    }
+    return 0;
 }
