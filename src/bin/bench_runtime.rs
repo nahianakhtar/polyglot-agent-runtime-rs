@@ -1,6 +1,6 @@
 use polyglot_agent_runtime::{
     capabilities, BoundedTelemetryVault, CapabilityDagOrchestrator, CircuitBreaker, DagNode,
-    RetryPolicy, StreamingQuantileSuite,
+    DeterministicTokenBucket, RetryPolicy, StreamingQuantileSuite,
 };
 use std::hint::black_box;
 use std::time::Instant;
@@ -119,10 +119,24 @@ fn main() {
     let p2_ns_per_obs = p2_secs * 1_000_000_000.0 / (p2_iters as f64);
     let p2_snap = p2.snapshot();
 
+    // 4. Deterministic C11 Token-Bucket Rate Limiter Throughput
+    let tb_iters: u64 = 5_000_000;
+    let mut tb = DeterministicTokenBucket::new(100_000, 50_000_000, 0).expect("valid token bucket");
+    let tb0 = Instant::now();
+    for step in 0..tb_iters {
+        let dec = tb
+            .try_acquire(black_box(1_000), black_box(step * 25))
+            .expect("valid acquire");
+        black_box(dec);
+    }
+    let tb_secs = tb0.elapsed().as_secs_f64();
+    let tb_ops_per_sec = (tb_iters as f64) / tb_secs;
+    let tb_ns_per_op = tb_secs * 1_000_000_000.0 / (tb_iters as f64);
+
     println!(
         r#"{{
   "runtime": "polyglot-agent-runtime-rs",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "c11_ring_vault": {{
     "iterations": {ring_iters},
     "verified_slots": {verified_slots},
@@ -131,6 +145,14 @@ fn main() {
     "p50_latency_us": {ring_p50:.4},
     "p95_latency_us": {ring_p95:.4},
     "p99_latency_us": {ring_p99:.4}
+  }},
+  "c11_token_bucket": {{
+    "iterations": {tb_iters},
+    "ops_per_sec": {tb_ops:.1},
+    "ns_per_op": {tb_ns:.2},
+    "allowed": {tb_allowed},
+    "denied": {tb_denied},
+    "state_bytes": 64
   }},
   "capability_dag_orchestrator": {{
     "iterations": {dag_iters},
@@ -155,6 +177,10 @@ fn main() {
         ring_p50 = ring_snap.p50,
         ring_p95 = ring_snap.p95,
         ring_p99 = ring_snap.p99,
+        tb_ops = tb_ops_per_sec,
+        tb_ns = tb_ns_per_op,
+        tb_allowed = tb.allowed_count(),
+        tb_denied = tb.denied_count(),
         dags_sec = dags_per_sec,
         dag_p50 = dag_snap.p50,
         dag_p95 = dag_snap.p95,
