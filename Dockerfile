@@ -1,3 +1,4 @@
+# Containerized release build for polyglot-agent-runtime-rs v1.2.0
 FROM rust:1.83-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
