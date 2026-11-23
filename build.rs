@@ -6,6 +6,13 @@ fn main() {
     println!("cargo:rerun-if-changed=c_src/ring_crc.h");
     println!("cargo:rerun-if-changed=c_src/ring_crc.c");
 
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_arch == "wasm32" {
+        // wasm32-unknown-unknown uses the bit-identical pure-Rust Castagnoli CRC32C
+        // & ring validator in src/lib.rs while exporting native WASM C-ABI symbols.
+        return;
+    }
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set by Cargo"));
     let obj_path = out_dir.join("ring_crc.o");
     let lib_path = out_dir.join("libring_crc.a");
