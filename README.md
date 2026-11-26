@@ -28,10 +28,10 @@ flowchart LR
 | Subsystem | Workload | Throughput | Unit Cost / Latency | $p_{50}$ Latency | $p_{95}$ Latency | $p_{99}$ Latency | Memory Invariant |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
 | **C11 CRC32C Ring Vault (`seal + validate`)** | `1,000,000` ops | **`3,138,485 ops/s`** | **`318.6 ns/op`** | **`0.3169 µs`** | **`0.3643 µs`** | **`0.4712 µs`** | `0` heap allocs post-init (`256 B/slot`) |
-| **C11 Rational Token Bucket (`try_acquire`)** | `5,000,000` ops | **`12,760,307 ops/s`** | **`78.4 ns/op`** | — | — | — | **`64 B` (`1` cache line, `0` float drift)** |
+| **C11 Rational Token Bucket (`try_acquire`)** | `5,000,000` ops | **`12,760,307 ops/s`** | **`78.4 ns/op`** | `N/A` | `N/A` | `N/A` | **`64 B` (`1` cache line, `0` float drift)** |
 | **Capability-Fenced DAG (`6` nodes)** | `50,000` DAGs | **`409,696 DAGs/s`** | **`2.44 µs/DAG`** | **`2.051 µs`** | **`5.807 µs`** | **`6.020 µs`** | Deterministic `BTreeSet` Kahn queue |
-| **Jain-Chlamtac $P^2$ (`p50/p95/p99` Native)** | `2,000,000` obs | **`37,379,099 obs/s`** | **`26.8 ns/obs`** | — | — | — | **`560 B` (`O(1)` 64-bit state)** |
-| **Jain-Chlamtac $P^2$ (`wasm32-unknown-unknown`)** | `2,048,000` obs | **`30,784,214 obs/s`** | **`32.5 ns/obs`** | — | — | — | **`512 B` (`O(1)` WASM state, `33.5 KB` `.wasm`)** |
+| **Jain-Chlamtac $P^2$ (`p50/p95/p99` Native)** | `2,000,000` obs | **`37,379,099 obs/s`** | **`26.8 ns/obs`** | `N/A` | `N/A` | `N/A` | **`560 B` (`O(1)` 64-bit state)** |
+| **Jain-Chlamtac $P^2$ (`wasm32-unknown-unknown`)** | `2,048,000` obs | **`30,784,214 obs/s`** | **`32.5 ns/obs`** | `N/A` | `N/A` | `N/A` | **`512 B` (`O(1)` WASM state, `33.5 KB` `.wasm`)** |
 
 ---
 
