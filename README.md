@@ -2,11 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2021%20Edition-orange.svg)](Cargo.toml)
-[![C11 FFI](https://img.shields.io/badge/FFI-ISO%20C11%20--Werror-blue.svg)](c_src/ring_crc.c)
+[![C11 FFI](https://img.shields.io/badge/FFI-ISO%20C11%20--Werror-blue.svg)](https://github.com/nahianakhtar/polyglot-agent-runtime-rs/blob/main/c_src/ring_crc.c)
 [![External Deps](https://img.shields.io/badge/Runtime%20Dependencies-0-brightgreen.svg)](Cargo.toml)
-[![WASM32](https://img.shields.io/badge/Target-wasm32--unknown--unknown-purple.svg)](scripts/verify_wasm_p2.mjs)
+[![WASM32](https://img.shields.io/badge/Target-wasm32--unknown--unknown-purple.svg)](https://github.com/nahianakhtar/polyglot-agent-runtime-rs/blob/main/scripts/verify_wasm_p2.mjs)
 
-Deterministic, zero-dependency **Rust 2021 + ISO C11 FFI + `wasm32`** systems runtime engineered for sub-microsecond AI agent telemetry, zero-float-drift token-bucket rate limiting, capability-fenced DAG orchestration, tamper-evident audit rings, and constant-memory (`O(1)`) streaming tail-latency estimation.
+Zero-dependency **Rust 2021 + ISO C11 FFI + `wasm32`** systems runtime engineered for sub-microsecond AI agent telemetry, exact-rational token-bucket rate limiting, capability-fenced DAG orchestration, tamper-evident audit rings, and constant-memory (`O(1)`) streaming tail-latency estimation.
 
 ---
 
@@ -29,7 +29,7 @@ flowchart LR
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
 | **C11 CRC32C Ring Vault (`seal + validate`)** | `1,000,000` ops | **`3,138,485 ops/s`** | **`318.6 ns/op`** | **`0.3169 µs`** | **`0.3643 µs`** | **`0.4712 µs`** | `0` heap allocs post-init (`256 B/slot`) |
 | **C11 Rational Token Bucket (`try_acquire`)** | `5,000,000` ops | **`12,760,307 ops/s`** | **`78.4 ns/op`** | `N/A` | `N/A` | `N/A` | **`64 B` (`1` cache line, `0` float drift)** |
-| **Capability-Fenced DAG (`6` nodes)** | `50,000` DAGs | **`409,696 DAGs/s`** | **`2.44 µs/DAG`** | **`2.051 µs`** | **`5.807 µs`** | **`6.020 µs`** | Deterministic `BTreeSet` Kahn queue |
+| **Capability-Fenced DAG (`6` nodes)** | `50,000` DAGs | **`409,696 DAGs/s`** | **`2.44 µs/DAG`** | **`2.051 µs`** | **`5.807 µs`** | **`6.020 µs`** | Ordered `BTreeSet` Kahn queue |
 | **Jain-Chlamtac $P^2$ (`p50/p95/p99` Native)** | `2,000,000` obs | **`37,379,099 obs/s`** | **`26.8 ns/obs`** | `N/A` | `N/A` | `N/A` | **`560 B` (`O(1)` 64-bit state)** |
 | **Jain-Chlamtac $P^2$ (`wasm32-unknown-unknown`)** | `2,048,000` obs | **`30,784,214 obs/s`** | **`32.5 ns/obs`** | `N/A` | `N/A` | `N/A` | **`512 B` (`O(1)` WASM state, `33.5 KB` `.wasm`)** |
 
@@ -84,7 +84,7 @@ rustup target add wasm32-unknown-unknown
 cargo build --release --lib --target wasm32-unknown-unknown
 node scripts/verify_wasm_p2.mjs
 ```
-Exports zero-glue C-ABI symbols (`par_p2_suite_*`, `par_bucket_*`, `par_audit_ring_*`, `par_wasm_crc32c`) for zero-copy `Float64Array` linear-memory streaming, deterministic `64 B` token-bucket rate limiting, and `256 B/slot` CRC32C capability audit rings in browser dashboards and edge workers.
+Exports zero-glue C-ABI symbols (`par_p2_suite_*`, `par_bucket_*`, `par_audit_ring_*`, `par_wasm_crc32c`) for zero-copy `Float64Array` linear-memory streaming, exact `64 B` token-bucket rate limiting, and `256 B/slot` CRC32C capability audit rings in browser dashboards and edge workers.
 
 ### 4. Containerized Execution
 ```bash
